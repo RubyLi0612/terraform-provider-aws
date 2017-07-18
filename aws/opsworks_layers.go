@@ -10,7 +10,10 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/opsworks"
+	"github.com/hashicorp/errwrap"
+	"os"
 )
 
 // OpsWorks has a single concept of "layer" which represents several different
@@ -203,6 +206,11 @@ func (lt *opsworksLayerType) SchemaResource() *schema.Resource {
 				return hashcode.String(m["mount_point"].(string))
 			},
 		},
+
+		"layer_endpoint": {
+			Type:     schema.TypeString,
+			Computed: true,
+		},
 	}
 
 	if lt.CustomShortName {
@@ -236,20 +244,20 @@ func (lt *opsworksLayerType) SchemaResource() *schema.Resource {
 
 	return &schema.Resource{
 		Read: func(d *schema.ResourceData, meta interface{}) error {
-			client := meta.(*AWSClient).opsworksconn
-			return lt.Read(d, client)
+
+			return lt.Read(d, meta)
 		},
 		Create: func(d *schema.ResourceData, meta interface{}) error {
-			client := meta.(*AWSClient).opsworksconn
-			return lt.Create(d, client)
+
+			return lt.Create(d, meta)
 		},
 		Update: func(d *schema.ResourceData, meta interface{}) error {
-			client := meta.(*AWSClient).opsworksconn
-			return lt.Update(d, client)
+
+			return lt.Update(d, meta)
 		},
 		Delete: func(d *schema.ResourceData, meta interface{}) error {
-			client := meta.(*AWSClient).opsworksconn
-			return lt.Delete(d, client)
+
+			return lt.Delete(d, meta)
 		},
 		Importer: &schema.ResourceImporter{
 			State: schema.ImportStatePassthrough,
@@ -259,7 +267,44 @@ func (lt *opsworksLayerType) SchemaResource() *schema.Resource {
 	}
 }
 
-func (lt *opsworksLayerType) Read(d *schema.ResourceData, client *opsworks.OpsWorks) error {
+func opsworksConnRegion(region string, meta interface{}) (*opsworks.OpsWorks, error) {
+	originalConn := meta.(*AWSClient).opsworksconn
+
+	// Regions are the same, no need to reconfigure
+	if originalConn.Config.Region != nil && *originalConn.Config.Region == region {
+		return originalConn, nil
+	}
+
+	// Set up base session
+	sess, err := session.NewSession(&originalConn.Config)
+	if err != nil {
+		return nil, errwrap.Wrapf("Error creating AWS session: {{err}}", err)
+	}
+
+	sess.Handlers.Build.PushBackNamed(addTerraformVersionToUserAgent)
+
+	if extraDebug := os.Getenv("TERRAFORM_AWS_AUTHFAILURE_DEBUG"); extraDebug != "" {
+		sess.Handlers.UnmarshalError.PushFrontNamed(debugAuthFailure)
+	}
+
+	newSession := sess.Copy(&aws.Config{Region: aws.String(region)})
+	newOpsworksconn := opsworks.New(newSession)
+
+	log.Printf("[DEBUG] Returning new OpsWorks client")
+	return newOpsworksconn, nil
+}
+
+func (lt *opsworksLayerType) Read(d *schema.ResourceData, meta interface{}) error {
+
+	client := meta.(*AWSClient).opsworksconn
+
+	var conErr error
+	if v := d.Get("layer_endpoint").(string); v != "" {
+		client, conErr = opsworksConnRegion(v, meta)
+		if conErr != nil {
+			return conErr
+		}
+	}
 
 	req := &opsworks.DescribeLayersInput{
 		LayerIds: []*string{
@@ -269,7 +314,7 @@ func (lt *opsworksLayerType) Read(d *schema.ResourceData, client *opsworks.OpsWo
 
 	log.Printf("[DEBUG] Reading OpsWorks layer: %s", d.Id())
 
-	resp, err := client.DescribeLayers(req)
+	/*resp, err := client.DescribeLayers(req)
 	if err != nil {
 		if awserr, ok := err.(awserr.Error); ok {
 			if awserr.Code() == "ResourceNotFoundException" {
@@ -278,6 +323,49 @@ func (lt *opsworksLayerType) Read(d *schema.ResourceData, client *opsworks.OpsWo
 			}
 		}
 		return err
+	}*/
+	var notFound int
+	var resp *opsworks.DescribeLayersOutput
+	var dErr error
+
+	for {
+		resp, dErr = client.DescribeLayers(req)
+		if dErr != nil {
+			if awserr, ok := dErr.(awserr.Error); ok {
+				if awserr.Code() == "ResourceNotFoundException" {
+					if notFound < 1 {
+						// If we haven't already, try us-east-1, legacy connection
+						notFound++
+						var connErr error
+						client, connErr = opsworksConnRegion("us-east-1", meta)
+						if connErr != nil {
+							return connErr
+						}
+						// start again from the top of the FOR loop, but with a client
+						// configured to talk to us-east-1
+						continue
+					}
+
+					// We've tried both the original and us-east-1 endpoint, and the layer
+					// is still not found
+					log.Printf("[DEBUG] OpsWorks layer (%s) not found", d.Id())
+					d.SetId("")
+					return nil
+				}
+				// not ResoureNotFoundException, fall through to returning error
+			}
+			return dErr
+		}
+		// If the layer was found, set the layer_endpoint
+		if client.Config.Region != nil && *client.Config.Region != "" {
+			log.Printf("[DEBUG] Setting layer for (%s) to (%s)", d.Id(), *client.Config.Region)
+			if err := d.Set("layer_endpoint", *client.Config.Region); err != nil {
+				log.Printf("[WARN] Error setting layer_endpoint: %s", err)
+			}
+		}
+		log.Printf("[DEBUG] Breaking layer endpoint search, found layer for (%s)", d.Id())
+		// Break the FOR loop
+		break
 	}
 
 	layer := resp.Layers[0]
@@ -333,7 +421,9 @@ func (lt *opsworksLayerType) Read(d *schema.ResourceData, client *opsworks.OpsWo
 	return nil
 }
 
-func (lt *opsworksLayerType) Create(d *schema.ResourceData, client *opsworks.OpsWorks) error {
+func (lt *opsworksLayerType) Create(d *schema.ResourceData, meta interface{}) error {
+
+	client := meta.(*AWSClient).opsworksconn
 
 	req := &opsworks.CreateLayerInput{
 		AutoAssignElasticIps:        aws.Bool(d.Get("auto_assign_elastic_ips").(bool)),
@@ -384,10 +474,19 @@ func (lt *opsworksLayerType) Create(d *schema.ResourceData, client *opsworks.Ops
 		}
 	}
 
-	return lt.Read(d, client)
+	return lt.Read(d, meta)
 }
 
-func (lt *opsworksLayerType) Update(d *schema.ResourceData, client *opsworks.OpsWorks) error {
+func (lt *opsworksLayerType) Update(d *schema.ResourceData, meta interface{}) error {
+
+	client := meta.(*AWSClient).opsworksconn
+	var conErr error
+	if v := d.Get("layer_endpoint").(string); v != "" {
+		client, conErr = opsworksConnRegion(v, meta)
+		if conErr != nil {
+			return conErr
+		}
+	}
 
 	req := &opsworks.UpdateLayerInput{
 		LayerId:                     aws.String(d.Id()),
@@ -450,10 +549,19 @@ func (lt *opsworksLayerType) Update(d *schema.ResourceData, client *opsworks.Ops
 		return err
 	}
 
-	return lt.Read(d, client)
+	return lt.Read(d, meta)
 }
 
-func (lt *opsworksLayerType) Delete(d *schema.ResourceData, client *opsworks.OpsWorks) error {
+func (lt *opsworksLayerType) Delete(d *schema.ResourceData, meta interface{}) error {
+	client := meta.(*AWSClient).opsworksconn
+	var conErr error
+	if v := d.Get("layer_endpoint").(string); v != "" {
+		client, conErr = opsworksConnRegion(v, meta)
+		if conErr != nil {
+			return conErr
+		}
+	}
+
 	req := &opsworks.DeleteLayerInput{
 		LayerId: aws.String(d.Id()),
 	}
