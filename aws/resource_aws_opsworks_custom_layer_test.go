@@ -407,3 +407,70 @@ resource "aws_opsworks_custom_layer" "tf-acc" {
 
 `, name, testAccAwsOpsworksStackConfigNoVpcCreate(name), testAccAwsOpsworksCustomLayerSecurityGroups(name))
 }
+
+
+// Tests the addition of regional endpoints and supporting the classic link used
+// to create Stack's prior to v0.9.0.
+// See https://github.com/hashicorp/terraform/issues/12842
+func TestAccAwsOpsworksCustomLayerEndpoints(t *testing.T) {
+	stackName := fmt.Sprintf("tf-%d", acctest.RandInt())
+	rInt := acctest.RandInt()
+	var opslayer opsworks.Layer
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckAwsOpsworksCustomLayerDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccAwsOpsworksCustomLayerConfigEndpoint(stackName, rInt),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckAWSOpsworksCustomLayerExists(
+						"aws_opsworks_custom_layer.tf-acc", &opslayer),
+					resource.TestCheckResourceAttr(
+						"aws_opsworks_custom_layer.tf-acc", "name", stackName,
+					),
+				),
+			},
+			{
+				// Ensure that changing to us-west-2 region results in no plan
+				Config: testAccAwsOpsworksCustomLayerConfigEndpointUpdate(stackName, rInt),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(
+						"aws_opsworks_custom_layer.tf-acc", "name", stackName,
+					),
+
+				),
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
+
+func testAccAwsOpsworksCustomLayerConfigEndpoint(name string, rInt int) string {
+	return fmt.Sprintf(`
+
+resource "aws_opsworks_custom_layer" "tf-acc" {
+  stack_id = "${aws_opsworks_stack.main.id}"
+  name = "%s"
+  short_name = "tf-ops-acc-custom-layer"
+}
+
+%s
+
+`, name, testAccAwsOpsWorksStack_classic_endpoint(name, rInt))
+}
+
+func testAccAwsOpsworksCustomLayerConfigEndpointUpdate(name string, rInt int) string {
+	return fmt.Sprintf(`
+
+resource "aws_opsworks_custom_layer" "tf-acc" {
+  stack_id = "${aws_opsworks_stack.main.id}"
+  name = "%s"
+  short_name = "tf-ops-acc-custom-layer"
+}
+
+%s
+
+`, name, testAccAwsOpsWorksStack_regional_endpoint(name, rInt))
+}
